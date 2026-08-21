@@ -1,4 +1,4 @@
-# Domain Liveness Checker
+# Domain Checker
 
 A small Python service that checks whether a company's website is actually live and how fast it responds — built while learning the GTM engineering stack (Clay + n8n + Python).
 
@@ -91,12 +91,21 @@ Requires a header `x-api-key` matching the `DOMAIN_CHECKER_API_KEY` environment 
 - **Windows PowerShell isn't bash.** `export VAR=value` doesn't work in PowerShell — it's `$env:VAR = "value"`, and it only lasts for that terminal window. PowerShell's `curl` is actually an alias for `Invoke-WebRequest`, which doesn't take `-X`/`-H` the way real curl does — `Invoke-RestMethod` (or `curl.exe` explicitly) is the reliable way to test from PowerShell.
 - **Simple auth matters once a local server goes public.** An ngrok tunnel makes a laptop's local server reachable by anyone with the URL. A single shared-secret header (`x-api-key`) is a five-line fix for that.
 
+## n8n workflow
+
+The same endpoint also works from n8n, not just Clay. Workflow: `Manual Trigger → HTTP Request (POST /check-domain) → IF (is_live == true) → branches into "Would enter outreach sequence" / "Flag as dead — skip"`.
+
+`n8n-workflow.png` — the working workflow, executed successfully end to end against the live ngrok endpoint.
+
+This is the minimum useful shape for this kind of check inside an automation platform: call an external service, then branch on the result instead of treating every lead the same way.
+
 ## Screenshot
 
 `clay-table-results.png` — the Clay table with `is_live`, `status_code`, `final_url`, and `response_time_ms` populated for a batch of real companies (Simera, Joinrs, Recrut.AI, Twine, ByteByteGo, Talentify, DeepLearning.AI, CodeChef).
 
 ## Next steps
 
-- [ ] Wire the same endpoint into an n8n HTTP Request node.
+- [x] Wire the same endpoint into an n8n HTTP Request node.
+- [ ] Replace the placeholder "Would enter outreach sequence" / "Flag as dead" nodes with a real HubSpot/outreach-tool action.
 - [ ] Move off ngrok to permanent hosting once the build is stable.
 - [ ] Feed `is_live` / `response_time_ms` into the outreach personalization step — e.g., skip companies with a dead site, or reference site speed as a genuine observation in the opener.
