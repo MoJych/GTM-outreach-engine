@@ -128,15 +128,16 @@ The same endpoint also works from n8n, not just Clay. Workflow: `Manual Trigger 
 
 This is the minimum useful shape for this kind of check inside an automation platform: call an external service, then branch on the result instead of treating every lead the same way.
 
-## Screenshot
+## Screenshots
 
-`clay-table-results.png` — the Clay table with `is_live`, `status_code`, `final_url`, and `response_time_ms` populated for a batch of real companies (Simera, Joinrs, Recrut.AI, Twine, ByteByteGo, Talentify, DeepLearning.AI, CodeChef).
+- `clay-table-results.png` — the Clay table with `is_live`, `status_code`, `final_url`, and `response_time_ms` populated for a batch of real companies (Simera, Joinrs, Recrut.AI, Twine, ByteByteGo, Talentify, DeepLearning.AI, CodeChef).
+- `clay-personalize-results.png` — a second HTTP API column, `/personalize-opener`, wired into the same table (`company_name`/`domain` mapped from a Company Domain field, `context` mapped from an existing "Personalized Outreach" enrichment's `reasoning` field), returning `200 OK` across the batch.
 
 ## Next steps
 
 - [x] Wire the same endpoint into an n8n HTTP Request node.
 - [x] Add an AI personalization step (`/personalize-opener`) gated by a quality check.
-- [ ] Wire `/personalize-opener` into the Clay table as a new HTTP API column, using a real per-company signal as `context`.
+- [x] Wire `/personalize-opener` into the Clay table as a new HTTP API column, using a real per-company signal as `context`.
 - [ ] Replace the placeholder "Would enter outreach sequence" / "Flag as dead" nodes with a real HubSpot/outreach-tool action.
 - [ ] Move off ngrok to permanent hosting once the build is stable.
 - [ ] Feed `is_live` / `response_time_ms` into the outreach personalization step — e.g., skip companies with a dead site, or reference site speed as a genuine observation in the opener.
