@@ -36,20 +36,46 @@ HOW TO RUN
 If you skip step 2 (no DOMAIN_CHECKER_API_KEY set), the key check is
 skipped entirely — fine for a quick local test, not fine once the ngrok
 URL is live and reachable by anyone.
+
+PHASE 4 ADDITION — /personalize-opener
+---------------------------------------
+Also set an Anthropic API key (get one at console.anthropic.com, under
+Settings > API Keys — needs a payment method on file, cost per call here
+is a fraction of a cent on the Haiku model):
+
+    $env:ANTHROPIC_API_KEY = "sk-ant-..."
+
+Then call:
+    POST /personalize-opener?company_name=Acme&domain=acme.com&context=Just raised a Series A
+    Headers: x-api-key: <same DOMAIN_CHECKER_API_KEY as above>
 """
 
 import os
 import time
 
 from fastapi import FastAPI, Header, HTTPException, Request
+from fastapi.responses import JSONResponse
 import requests
 
-app = FastAPI()
+
+class UTF8JSONResponse(JSONResponse):
+    # Windows PowerShell 5.1's Invoke-RestMethod mis-decodes non-ASCII
+    # characters (like an em dash "—") unless the response explicitly
+    # says charset=utf-8 — the plain "application/json" that FastAPI
+    # sends by default isn't enough for it to guess right.
+    media_type = "application/json; charset=utf-8"
+
+
+app = FastAPI(default_response_class=UTF8JSONResponse)
 
 # Shared-secret auth: set this env var before starting the server. Any
 # caller must send the same value back in the x-api-key header, or they
 # get a 401. Leave it unset only for quick local testing.
 API_KEY = os.environ.get("DOMAIN_CHECKER_API_KEY")
+
+# Anthropic API key for the /personalize-opener endpoint (Phase 4).
+ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
+ANTHROPIC_MODEL = "claude-haiku-4-5"
 
 # A real-looking User-Agent — many sites silently block the default
 # "python-requests/x.x" one with a 403.
@@ -59,6 +85,27 @@ REQUEST_HEADERS = {
 
 TIMEOUT_SECONDS = 5
 
+# Phrases that make an opener sound like every other cold email —
+# reject on sight rather than let them through the quality gate.
+GENERIC_PHRASES = [
+    "i hope this email finds you well",
+    "i came across your company",
+    "i noticed your website",
+    "in today's fast-paced world",
+    "as a leading",
+    "hope you're doing well",
+]
+
+
+async def get_field(request: Request, body: dict, name: str):
+    """Read a field from the query string first, then fall back to an
+    already-parsed JSON body — same flexible pattern as /check-domain,
+    since different tools (Clay, n8n, curl) send data differently."""
+    value = request.query_params.get(name)
+    if value:
+        return value
+    return body.get(name) if body else None
+
 
 def clean_domain(raw: str) -> str:
     """Strip any scheme/leading-or-trailing slash the caller might have
@@ -67,6 +114,34 @@ def clean_domain(raw: str) -> str:
     d = raw.strip()
     d = d.replace("https://", "").replace("http://", "")
     return d.strip("/")
+
+
+def quality_gate(opener: str, context: str):
+    """Cheap heuristic check — no second LLM call needed. Flags generic
+    phrasing, bad length, and openers that don't actually reference the
+    fact they were supposed to be based on."""
+    reasons = []
+    lower = opener.lower()
+
+    for phrase in GENERIC_PHRASES:
+        if phrase in lower:
+            reasons.append(f"contains generic phrase: '{phrase}'")
+
+    word_count = len(opener.split())
+    if word_count > 30:
+        reasons.append(f"too long ({word_count} words, aim for under ~25)")
+    if word_count < 4:
+        reasons.append("too short to be a real sentence")
+
+    context_words = {w.strip(".,!?").lower() for w in context.split() if len(w) > 4}
+    opener_words = {w.strip(".,!?").lower() for w in opener.split()}
+    if context_words and not (context_words & opener_words):
+        reasons.append("doesn't seem to reference the given fact")
+
+    if "[" in opener or "]" in opener:
+        reasons.append("contains an unfilled placeholder like '[...]' — never send this as-is")
+
+    return (len(reasons) == 0, reasons)
 
 
 def probe(url: str):
@@ -129,3 +204,81 @@ async def check_domain(request: Request, x_api_key: str = Header(default=None)):
             continue
 
     return {"domain": domain, "is_live": False, "error": last_error}
+
+
+@app.post("/personalize-opener")
+async def personalize_opener(request: Request, x_api_key: str = Header(default=None)):
+    if API_KEY and x_api_key != API_KEY:
+        raise HTTPException(status_code=401, detail="invalid or missing x-api-key header")
+
+    if not ANTHROPIC_API_KEY:
+        raise HTTPException(
+            status_code=500,
+            detail="server is missing ANTHROPIC_API_KEY — set it and restart the server",
+        )
+
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+
+    company_name = await get_field(request, body, "company_name")
+    domain = await get_field(request, body, "domain")
+    context = await get_field(request, body, "context")
+
+    if not company_name or not context:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "need at least 'company_name' and 'context' (a real fact about the "
+                "company — e.g. 'just raised a Series A', 'site loads in 300ms', "
+                "'hiring 5 sales roles right now')"
+            ),
+        )
+
+    prompt = (
+        f"Write ONE short, specific opening line (max 25 words) for a cold outbound "
+        f"email to someone at {company_name}"
+        + (f" ({domain})" if domain else "")
+        + f". Base it on this real fact, and reference it concretely — do not invent "
+        f'anything not in the fact: "{context}". '
+        f"No greeting, no \"I hope this finds you well\", no generic flattery. "
+        f"Never use placeholder brackets like [specific use case] or [X] — if you don't "
+        f"have a concrete detail to fill a slot, leave it out entirely and write a "
+        f"complete sentence with no blanks. "
+        f"Return ONLY the finished sentence, nothing else."
+    )
+
+    try:
+        resp = requests.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={
+                "x-api-key": ANTHROPIC_API_KEY,
+                "anthropic-version": "2023-06-01",
+                "content-type": "application/json",
+            },
+            json={
+                "model": ANTHROPIC_MODEL,
+                "max_tokens": 100,
+                "messages": [{"role": "user", "content": prompt}],
+            },
+            timeout=15,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        opener = data["content"][0]["text"].strip()
+    except requests.exceptions.RequestException as e:
+        raise HTTPException(status_code=502, detail=f"LLM call failed: {e}")
+    except (KeyError, IndexError):
+        raise HTTPException(status_code=502, detail="unexpected response shape from LLM API")
+
+    passed, reasons = quality_gate(opener, context)
+
+    return {
+        "company_name": company_name,
+        "domain": domain,
+        "context_used": context,
+        "opener": opener,
+        "passed_quality_check": passed,
+        "quality_notes": reasons,
+    }
