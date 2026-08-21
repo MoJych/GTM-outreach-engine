@@ -96,6 +96,27 @@ GENERIC_PHRASES = [
     "hope you're doing well",
 ]
 
+# If the LLM was given garbage input (e.g. a "fact" that was actually
+# meta-instructions rather than a real detail about the company), it can
+# reply with a refusal/explanation instead of an opener — real example:
+# it wrote "I can't write this email opening because the instruction
+# asks me to reference a 'personalization hook'... but that fact is
+# itself a meta-description..." instead of an actual sentence. The
+# length check below catches most of these (refusals run long), but
+# check explicitly too, since a short refusal like "I need more
+# specific information to help with this" could otherwise slip through.
+REFUSAL_PATTERNS = [
+    "i can't write this",
+    "i cannot write this",
+    "i'm unable to",
+    "i am unable to",
+    "as an ai",
+    "i don't have enough information",
+    "i need more information",
+    "i need more specific information",
+    "i'd need real information",
+]
+
 
 async def get_field(request: Request, body: dict, name: str):
     """Read a field from the query string first, then fall back to an
@@ -126,6 +147,10 @@ def quality_gate(opener: str, context: str):
     for phrase in GENERIC_PHRASES:
         if phrase in lower:
             reasons.append(f"contains generic phrase: '{phrase}'")
+
+    for phrase in REFUSAL_PATTERNS:
+        if phrase in lower:
+            reasons.append(f"looks like a refusal, not an opener: contains '{phrase}'")
 
     word_count = len(opener.split())
     if word_count > 30:
