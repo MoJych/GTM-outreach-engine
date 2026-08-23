@@ -307,3 +307,7 @@ async def personalize_opener(request: Request, x_api_key: str = Header(default=N
         "passed_quality_check": passed,
         "quality_notes": reasons,
     }
+
+@app.get("/health")
+def health():
+    return {"status": "ok"}
