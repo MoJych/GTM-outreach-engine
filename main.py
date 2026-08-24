@@ -48,6 +48,20 @@ is a fraction of a cent on the Haiku model):
 Then call:
     POST /personalize-opener?company_name=Acme&domain=acme.com&context=Just raised a Series A
     Headers: x-api-key: <same DOMAIN_CHECKER_API_KEY as above>
+
+PHASE 5 ADDITION — /classify-reply
+-----------------------------------
+Closes the loop past "email sent". No new env vars needed — reuses the
+same DOMAIN_CHECKER_API_KEY and ANTHROPIC_API_KEY as above. Meant to be
+called from an n8n workflow whose trigger is an Email Trigger (IMAP)
+node watching the outreach inbox for replies — n8n catches the reply,
+this endpoint classifies it, n8n branches on the result (update the
+HubSpot deal stage, send a Calendly link, post to Slack, or do nothing
+for an auto-reply). No database here on purpose — HubSpot is treated as
+the system of record for lead state, not a new store built for this.
+
+    POST /classify-reply?reply_text=Thanks, this looks interesting, can we talk Tuesday?&company_name=Acme
+    Headers: x-api-key: <same DOMAIN_CHECKER_API_KEY as above>
 """
 
 import os
@@ -73,9 +87,25 @@ app = FastAPI(default_response_class=UTF8JSONResponse)
 # get a 401. Leave it unset only for quick local testing.
 API_KEY = os.environ.get("DOMAIN_CHECKER_API_KEY")
 
-# Anthropic API key for the /personalize-opener endpoint (Phase 4).
+# Anthropic API key for the /personalize-opener and /classify-reply
+# endpoints (Phase 4 and Phase 5).
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
 ANTHROPIC_MODEL = "claude-haiku-4-5"
+
+# The only four buckets /classify-reply is allowed to hand back — keeping
+# this a short, fixed set (rather than free-text) is what makes it safe
+# for n8n to branch on downstream without another layer of parsing.
+REPLY_LABELS = ("interested", "not_interested", "auto_reply", "needs_info")
+
+# What n8n should do for each label. This travels in the response so the
+# n8n workflow can switch on `suggested_action` directly instead of
+# hardcoding the label→action mapping a second time on the n8n side.
+REPLY_ACTIONS = {
+    "interested": "update_hubspot_stage:meeting_requested, send_calendly_link, notify_slack",
+    "not_interested": "update_hubspot_stage:closed_lost",
+    "auto_reply": "no_action, retry_later",
+    "needs_info": "flag_for_manual_review",
+}
 
 # A real-looking User-Agent — many sites silently block the default
 # "python-requests/x.x" one with a 403.
@@ -307,6 +337,89 @@ async def personalize_opener(request: Request, x_api_key: str = Header(default=N
         "passed_quality_check": passed,
         "quality_notes": reasons,
     }
+
+@app.post("/classify-reply")
+async def classify_reply(request: Request, x_api_key: str = Header(default=None)):
+    if API_KEY and x_api_key != API_KEY:
+        raise HTTPException(status_code=401, detail="invalid or missing x-api-key header")
+
+    if not ANTHROPIC_API_KEY:
+        raise HTTPException(
+            status_code=500,
+            detail="server is missing ANTHROPIC_API_KEY — set it and restart the server",
+        )
+
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+
+    reply_text = await get_field(request, body, "reply_text")
+    company_name = await get_field(request, body, "company_name")
+
+    if not reply_text:
+        raise HTTPException(
+            status_code=422,
+            detail="need 'reply_text' — the raw text of the email reply to classify",
+        )
+
+    prompt = (
+        f"You are triaging a reply to a cold B2B outbound email"
+        + (f" that was sent to someone at {company_name}" if company_name else "")
+        + f'. Here is the reply, verbatim:\n\n"""\n{reply_text}\n"""\n\n'
+        f"Classify it into EXACTLY ONE of these four labels:\n"
+        f"- interested — wants to talk, asks a question implying interest, proposes a time\n"
+        f"- not_interested — a clear no, unsubscribe request, or 'not a fit'\n"
+        f"- auto_reply — out-of-office, vacation responder, or an automated bounce/ack\n"
+        f"- needs_info — anything else: ambiguous, forwarded to someone else, unclear\n\n"
+        f"Reply with EXACTLY this format, nothing else:\n"
+        f"LABEL: one-sentence reason\n\n"
+        f"Example: interested: asks to book a call next Tuesday"
+    )
+
+    try:
+        resp = requests.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={
+                "x-api-key": ANTHROPIC_API_KEY,
+                "anthropic-version": "2023-06-01",
+                "content-type": "application/json",
+            },
+            json={
+                "model": ANTHROPIC_MODEL,
+                "max_tokens": 60,
+                "messages": [{"role": "user", "content": prompt}],
+            },
+            timeout=15,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        raw = data["content"][0]["text"].strip()
+    except requests.exceptions.RequestException as e:
+        raise HTTPException(status_code=502, detail=f"LLM call failed: {e}")
+    except (KeyError, IndexError):
+        raise HTTPException(status_code=502, detail="unexpected response shape from LLM API")
+
+    # Parse "label: reason" — fall back to needs_info if the model didn't
+    # follow the format, rather than crashing the endpoint. This mirrors
+    # quality_gate()'s philosophy: never let malformed LLM output become
+    # a silent wrong answer, make the uncertainty visible instead.
+    label, _, reason = raw.partition(":")
+    label = label.strip().lower()
+    reason = reason.strip() or raw
+
+    if label not in REPLY_LABELS:
+        label = "needs_info"
+        reason = f"model did not return a recognized label, raw output: '{raw}'"
+
+    return {
+        "company_name": company_name,
+        "reply_text": reply_text,
+        "classification": label,
+        "reason": reason,
+        "suggested_action": REPLY_ACTIONS[label],
+    }
+
 
 @app.get("/health")
 def health():
