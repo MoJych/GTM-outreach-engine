@@ -62,9 +62,41 @@ the system of record for lead state, not a new store built for this.
 
     POST /classify-reply?reply_text=Thanks, this looks interesting, can we talk Tuesday?&company_name=Acme
     Headers: x-api-key: <same DOMAIN_CHECKER_API_KEY as above>
+
+PHASE 6 ADDITION — /handle-reply
+---------------------------------
+The endpoint n8n's Email Trigger (IMAP) actually calls. Resolves the
+sender against HubSpot instead of hardcoding addresses in the workflow,
+so the lead list can grow without editing n8n. Needs HUBSPOT_API_KEY
+(a HubSpot Private App token with crm.objects.contacts.read).
+
+PHASE 7 ADDITION — two campaigns, one service
+----------------------------------------------
+The original build sold outbound automation TO companies. The current
+campaign is the opposite direction: getting hired or contracted BY them.
+Both run through the same endpoints, switched by one field.
+
+    /personalize-opener now takes an optional `intent`:
+        intent=service  (default) — sell outbound automation to them.
+                        Unchanged behaviour; the existing Clay column
+                        sends no `intent` and is unaffected.
+        intent=job      — pitch building/running it for them. Different
+                        prompt, and quality_gate() additionally rejects
+                        cover-letter cliches and any opener that starts
+                        with "I"/"My"/"As" (leading with the sender is
+                        the standard way this kind of email dies).
+
+    POST /personalize-opener?company_name=Acme&domain=acme.com&intent=job&context=Hiring two SDRs and a RevOps lead this quarter
+
+    /classify-reply and /handle-reply gained a fifth label, `referral`
+    — "I'm not the right person, talk to X". Under the old four labels
+    that landed in needs_info and got parked for manual review; in a
+    hiring campaign it is a warm intro and one of the best outcomes
+    available, so it gets its own branch.
 """
 
 import os
+import re
 import time
 
 from fastapi import FastAPI, Header, HTTPException, Request
@@ -92,16 +124,43 @@ API_KEY = os.environ.get("DOMAIN_CHECKER_API_KEY")
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
 ANTHROPIC_MODEL = "claude-haiku-4-5"
 
+# PHASE 6 ADDITION — HubSpot lookup for /handle-reply. This is what
+# replaces a hardcoded n8n filter of "only these 3 sender emails" — the
+# moment a new lead is added to HubSpot, replies from them get routed
+# automatically, no workflow edits needed as the list grows past 3, 30,
+# or 300 contacts. Create this under HubSpot Settings > Integrations >
+# Private Apps, with at least crm.objects.contacts.read scope.
+HUBSPOT_API_KEY = os.environ.get("HUBSPOT_API_KEY")
+
 # The only four buckets /classify-reply is allowed to hand back — keeping
 # this a short, fixed set (rather than free-text) is what makes it safe
 # for n8n to branch on downstream without another layer of parsing.
-REPLY_LABELS = ("interested", "not_interested", "auto_reply", "needs_info")
+REPLY_LABELS = (
+    "interested",
+    "referral",
+    "not_interested",
+    "auto_reply",
+    "needs_info",
+)
+
+# Ordered longest-first for the fallback scan in classify_reply_text().
+# This matters: "interested" is a substring of "not_interested", so a
+# naive scan over REPLY_LABELS in declaration order would read a clear
+# rejection as interest. Scanning longest-first makes the specific label
+# win over the one contained inside it.
+REPLY_LABELS_BY_LENGTH = tuple(sorted(REPLY_LABELS, key=len, reverse=True))
 
 # What n8n should do for each label. This travels in the response so the
 # n8n workflow can switch on `suggested_action` directly instead of
 # hardcoding the label→action mapping a second time on the n8n side.
 REPLY_ACTIONS = {
     "interested": "update_hubspot_stage:meeting_requested, send_calendly_link, notify_slack",
+    # Added for the job/contract campaign: "I'm not the right person,
+    # talk to X" is one of the most common and most valuable replies to
+    # cold outreach aimed at getting hired, and it is NOT ambiguous — it
+    # is a warm intro waiting to be acted on. Previously it fell into
+    # needs_info and got parked in a manual-review pile.
+    "referral": "extract_referred_person, update_hubspot_stage:referred, notify_telegram",
     "not_interested": "update_hubspot_stage:closed_lost",
     "auto_reply": "no_action, retry_later",
     "needs_info": "flag_for_manual_review",
@@ -126,6 +185,32 @@ GENERIC_PHRASES = [
     "hope you're doing well",
 ]
 
+# An opener pitching yourself for work fails differently from one
+# selling a service: the cliches are cover-letter cliches, not cold-sales
+# ones, and GENERIC_PHRASES catches none of them. Kept as a separate list
+# so the `intent` switch on /personalize-opener applies the right one
+# without loosening the checks on the other.
+JOB_GENERIC_PHRASES = [
+    "i am writing to express",
+    "i'm writing to express",
+    "i would love the opportunity",
+    "i'd love the opportunity",
+    "i am passionate about",
+    "i'm passionate about",
+    "dear hiring manager",
+    "to whom it may concern",
+    "i believe i would be a great fit",
+    "i am reaching out to inquire",
+    "proven track record",
+    "i am excited about the opportunity",
+    "let me introduce myself",
+]
+
+# The two campaigns /personalize-opener can write for. "service" is the
+# original behaviour (selling outbound automation to a company) and stays
+# the default, so the existing Clay column keeps working untouched.
+OPENER_INTENTS = ("service", "job")
+
 # If the LLM was given garbage input (e.g. a "fact" that was actually
 # meta-instructions rather than a real detail about the company), it can
 # reply with a refusal/explanation instead of an opener — real example:
@@ -148,6 +233,142 @@ REFUSAL_PATTERNS = [
 ]
 
 
+# Matches the address inside "Display Name <email@domain.com>" — n8n's
+# IMAP node sends `from` in this shape almost always, occasionally as a
+# bare address with no angle brackets at all.
+EMAIL_ADDR_RE = re.compile(r"<([^<>]+)>")
+
+
+def extract_email(raw_from: str) -> str:
+    """Pull the bare email address out of an IMAP 'From' header."""
+    if not raw_from:
+        return ""
+    match = EMAIL_ADDR_RE.search(raw_from)
+    if match:
+        return match.group(1).strip().lower()
+    return raw_from.strip().lower()
+
+
+def find_hubspot_contact(email: str):
+    """Look up a contact by email in HubSpot. Returns the contact dict
+    ({'id': ..., 'properties': {...}}) if found, or None if this address
+    isn't a known lead — which is how /handle-reply tells a real reply
+    from an outreach target apart from unrelated inbox noise (YouTube
+    receipts, newsletters, etc.), without hardcoding any addresses."""
+    if not HUBSPOT_API_KEY:
+        raise HTTPException(
+            status_code=500,
+            detail="server is missing HUBSPOT_API_KEY — set it and restart the server",
+        )
+    try:
+        resp = requests.post(
+            "https://api.hubapi.com/crm/v3/objects/contacts/search",
+            headers={
+                "Authorization": f"Bearer {HUBSPOT_API_KEY}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "filterGroups": [
+                    {"filters": [{"propertyName": "email", "operator": "EQ", "value": email}]}
+                ],
+                "properties": ["email", "firstname", "lastname", "company"],
+                "limit": 1,
+            },
+            timeout=10,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+    except requests.exceptions.RequestException as e:
+        raise HTTPException(status_code=502, detail=f"HubSpot lookup failed: {e}")
+
+    results = data.get("results") or []
+    return results[0] if results else None
+
+
+def classify_reply_text(reply_text: str, company_name: str = None) -> dict:
+    """Core classification logic shared by /classify-reply (manual
+    testing, as before) and /handle-reply (the real IMAP-driven path).
+    Returns {'classification', 'reason', 'suggested_action'}."""
+    if not ANTHROPIC_API_KEY:
+        raise HTTPException(
+            status_code=500,
+            detail="server is missing ANTHROPIC_API_KEY — set it and restart the server",
+        )
+
+    prompt = (
+        f"You are triaging a reply to a cold B2B outbound email"
+        + (f" that was sent to someone at {company_name}" if company_name else "")
+        + f'. Here is the reply, verbatim:\n\n"""\n{reply_text}\n"""\n\n'
+        f"Classify it into EXACTLY ONE of these five labels:\n"
+        f"- interested — wants to talk, asks a question implying interest, proposes a time\n"
+        f"- referral — says they are not the right person and names or offers to "
+        f"introduce someone else, or forwards the thread onward. Use this even when "
+        f"the tone is lukewarm: a redirect to a named person is a referral, not "
+        f"ambiguity.\n"
+        f"- not_interested — a clear no, unsubscribe request, or 'not a fit'\n"
+        f"- auto_reply — out-of-office, vacation responder, or an automated bounce/ack\n"
+        f"- needs_info — anything else: genuinely ambiguous or unclear\n\n"
+        f"Respond with ONLY the label word itself — interested, referral, "
+        f"not_interested, auto_reply, or needs_info (do not write the word 'label', "
+        f"substitute the real one) — then a colon, then a one-sentence reason. If the "
+        f"label is referral and a person is named, put that name in the reason. "
+        f"Nothing else, no text before or after.\n\n"
+        f"Example: interested: asks to book a call next Tuesday"
+    )
+
+    try:
+        resp = requests.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={
+                "x-api-key": ANTHROPIC_API_KEY,
+                "anthropic-version": "2023-06-01",
+                "content-type": "application/json",
+            },
+            json={
+                "model": ANTHROPIC_MODEL,
+                "max_tokens": 60,
+                "messages": [{"role": "user", "content": prompt}],
+            },
+            timeout=15,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        raw = data["content"][0]["text"].strip()
+    except requests.exceptions.RequestException as e:
+        raise HTTPException(status_code=502, detail=f"LLM call failed: {e}")
+    except (KeyError, IndexError):
+        raise HTTPException(status_code=502, detail="unexpected response shape from LLM API")
+
+    # Parse "label: reason" — fall back to needs_info if the model didn't
+    # follow the format, rather than crashing the endpoint. This mirrors
+    # quality_gate()'s philosophy: never let malformed LLM output become
+    # a silent wrong answer, make the uncertainty visible instead.
+    label, _, reason = raw.partition(":")
+    label = label.strip().lower()
+    reason = reason.strip() or raw
+
+    if label not in REPLY_LABELS:
+        # Seen live on 24 Aug 2026: the model echoed the literal word
+        # "LABEL" from the format instructions instead of substituting a
+        # real one. The correct label was right there in the string,
+        # just not before the first colon — so before giving up, scan
+        # the whole response for one of the four known labels.
+        lower_raw = raw.lower()
+        recovered = next((l for l in REPLY_LABELS_BY_LENGTH if l in lower_raw), None)
+        if recovered:
+            label = recovered
+            reason = f"recovered via fallback scan (model ignored the format), raw output: '{raw}'"
+        else:
+            label = "needs_info"
+            reason = f"model did not return a recognized label, raw output: '{raw}'"
+
+    return {
+        "classification": label,
+        "reason": reason,
+        "suggested_action": REPLY_ACTIONS[label],
+    }
+
+
 async def get_field(request: Request, body: dict, name: str):
     """Read a field from the query string first, then fall back to an
     already-parsed JSON body — same flexible pattern as /check-domain,
@@ -167,14 +388,21 @@ def clean_domain(raw: str) -> str:
     return d.strip("/")
 
 
-def quality_gate(opener: str, context: str):
+def quality_gate(opener: str, context: str, intent: str = "service"):
     """Cheap heuristic check — no second LLM call needed. Flags generic
     phrasing, bad length, and openers that don't actually reference the
-    fact they were supposed to be based on."""
+    fact they were supposed to be based on.
+
+    `intent` selects which cliche list applies and turns on one extra
+    structural rule for job/contract outreach — see below."""
     reasons = []
     lower = opener.lower()
 
-    for phrase in GENERIC_PHRASES:
+    phrases = list(GENERIC_PHRASES)
+    if intent == "job":
+        phrases += JOB_GENERIC_PHRASES
+
+    for phrase in phrases:
         if phrase in lower:
             reasons.append(f"contains generic phrase: '{phrase}'")
 
@@ -195,6 +423,20 @@ def quality_gate(opener: str, context: str):
 
     if "[" in opener or "]" in opener:
         reasons.append("contains an unfilled placeholder like '[...]' — never send this as-is")
+
+    if intent == "job":
+        # A cold email written to get hired lives or dies on its first
+        # three words. If it opens with the sender, it reads as an
+        # application and gets skimmed; if it opens with an observation
+        # about the recipient's company, it reads as someone who did the
+        # work. This is the single most common failure mode in job
+        # outreach and it is cheap to detect.
+        first = opener.strip().split(" ")[0].strip(",.:;").lower()
+        if first in ("i", "i'm", "im", "my", "as", "hi", "hello", "hey"):
+            reasons.append(
+                f"opens with '{first}' — leads with the sender, which reads as an "
+                "application; lead with an observation about them instead"
+            )
 
     return (len(reasons) == 0, reasons)
 
@@ -281,6 +523,17 @@ async def personalize_opener(request: Request, x_api_key: str = Header(default=N
     domain = await get_field(request, body, "domain")
     context = await get_field(request, body, "context")
 
+    # PHASE 7 — which campaign this opener is for. Defaults to "service"
+    # so the existing Clay HTTP API column, which sends no `intent` at
+    # all, keeps behaving exactly as before.
+    intent = (await get_field(request, body, "intent")) or "service"
+    intent = intent.strip().lower()
+    if intent not in OPENER_INTENTS:
+        raise HTTPException(
+            status_code=422,
+            detail=f"'intent' must be one of {list(OPENER_INTENTS)} — got '{intent}'",
+        )
+
     if not company_name or not context:
         raise HTTPException(
             status_code=422,
@@ -291,18 +544,46 @@ async def personalize_opener(request: Request, x_api_key: str = Header(default=N
             ),
         )
 
-    prompt = (
-        f"Write ONE short, specific opening line (max 25 words) for a cold outbound "
-        f"email to someone at {company_name}"
-        + (f" ({domain})" if domain else "")
-        + f". Base it on this real fact, and reference it concretely — do not invent "
-        f'anything not in the fact: "{context}". '
-        f"No greeting, no \"I hope this finds you well\", no generic flattery. "
+    who = f"{company_name}" + (f" ({domain})" if domain else "")
+
+    shared_rules = (
         f"Never use placeholder brackets like [specific use case] or [X] — if you don't "
         f"have a concrete detail to fill a slot, leave it out entirely and write a "
         f"complete sentence with no blanks. "
         f"Return ONLY the finished sentence, nothing else."
     )
+
+    if intent == "job":
+        # The job/contract campaign. The ask is different from the service
+        # campaign in a way that changes the whole sentence: the sender is
+        # not offering to sell software, they are offering to build or run
+        # the thing in-house. The hard rule is to open on the company, not
+        # on the sender — see the matching check in quality_gate().
+        prompt = (
+            f"Write ONE short, specific opening line (max 25 words) for a cold email "
+            f"to a founder or growth/revenue lead at {who}. "
+            f"The sender is an independent engineer who builds automated outbound "
+            f"systems (Clay, n8n, and his own Python/FastAPI service) and wants to be "
+            f"hired or contracted to build one for them. "
+            f'Base the line on this real fact about the company, referenced concretely '
+            f'— do not invent anything not in the fact: "{context}". '
+            f"HARD RULES: the sentence must START with the company or an observation "
+            f"about them, never with 'I', 'My', 'As', or a greeting. Do not describe "
+            f"the sender's skills, do not ask for a job, do not use the words "
+            f"'opportunity', 'passionate', or 'reaching out'. No flattery. "
+            f"The goal is to sound like someone who already looked closely at their "
+            f"business, not like an applicant. "
+            + shared_rules
+        )
+    else:
+        prompt = (
+            f"Write ONE short, specific opening line (max 25 words) for a cold outbound "
+            f"email to someone at {who}"
+            + f". Base it on this real fact, and reference it concretely — do not invent "
+            f'anything not in the fact: "{context}". '
+            f"No greeting, no \"I hope this finds you well\", no generic flattery. "
+            + shared_rules
+        )
 
     try:
         resp = requests.post(
@@ -327,11 +608,12 @@ async def personalize_opener(request: Request, x_api_key: str = Header(default=N
     except (KeyError, IndexError):
         raise HTTPException(status_code=502, detail="unexpected response shape from LLM API")
 
-    passed, reasons = quality_gate(opener, context)
+    passed, reasons = quality_gate(opener, context, intent)
 
     return {
         "company_name": company_name,
         "domain": domain,
+        "intent": intent,
         "context_used": context,
         "opener": opener,
         "passed_quality_check": passed,
@@ -340,14 +622,12 @@ async def personalize_opener(request: Request, x_api_key: str = Header(default=N
 
 @app.post("/classify-reply")
 async def classify_reply(request: Request, x_api_key: str = Header(default=None)):
+    """Manual/testing entry point — classify a hand-typed reply_text with
+    no HubSpot lookup involved. Kept as-is for the Edit Fields-driven
+    testing workflow already validated in n8n. The real IMAP-driven path
+    is /handle-reply below, which adds the HubSpot sender check first."""
     if API_KEY and x_api_key != API_KEY:
         raise HTTPException(status_code=401, detail="invalid or missing x-api-key header")
-
-    if not ANTHROPIC_API_KEY:
-        raise HTTPException(
-            status_code=500,
-            detail="server is missing ANTHROPIC_API_KEY — set it and restart the server",
-        )
 
     try:
         body = await request.json()
@@ -363,61 +643,89 @@ async def classify_reply(request: Request, x_api_key: str = Header(default=None)
             detail="need 'reply_text' — the raw text of the email reply to classify",
         )
 
-    prompt = (
-        f"You are triaging a reply to a cold B2B outbound email"
-        + (f" that was sent to someone at {company_name}" if company_name else "")
-        + f'. Here is the reply, verbatim:\n\n"""\n{reply_text}\n"""\n\n'
-        f"Classify it into EXACTLY ONE of these four labels:\n"
-        f"- interested — wants to talk, asks a question implying interest, proposes a time\n"
-        f"- not_interested — a clear no, unsubscribe request, or 'not a fit'\n"
-        f"- auto_reply — out-of-office, vacation responder, or an automated bounce/ack\n"
-        f"- needs_info — anything else: ambiguous, forwarded to someone else, unclear\n\n"
-        f"Reply with EXACTLY this format, nothing else:\n"
-        f"LABEL: one-sentence reason\n\n"
-        f"Example: interested: asks to book a call next Tuesday"
-    )
-
-    try:
-        resp = requests.post(
-            "https://api.anthropic.com/v1/messages",
-            headers={
-                "x-api-key": ANTHROPIC_API_KEY,
-                "anthropic-version": "2023-06-01",
-                "content-type": "application/json",
-            },
-            json={
-                "model": ANTHROPIC_MODEL,
-                "max_tokens": 60,
-                "messages": [{"role": "user", "content": prompt}],
-            },
-            timeout=15,
-        )
-        resp.raise_for_status()
-        data = resp.json()
-        raw = data["content"][0]["text"].strip()
-    except requests.exceptions.RequestException as e:
-        raise HTTPException(status_code=502, detail=f"LLM call failed: {e}")
-    except (KeyError, IndexError):
-        raise HTTPException(status_code=502, detail="unexpected response shape from LLM API")
-
-    # Parse "label: reason" — fall back to needs_info if the model didn't
-    # follow the format, rather than crashing the endpoint. This mirrors
-    # quality_gate()'s philosophy: never let malformed LLM output become
-    # a silent wrong answer, make the uncertainty visible instead.
-    label, _, reason = raw.partition(":")
-    label = label.strip().lower()
-    reason = reason.strip() or raw
-
-    if label not in REPLY_LABELS:
-        label = "needs_info"
-        reason = f"model did not return a recognized label, raw output: '{raw}'"
+    result = classify_reply_text(reply_text, company_name)
 
     return {
         "company_name": company_name,
         "reply_text": reply_text,
-        "classification": label,
-        "reason": reason,
-        "suggested_action": REPLY_ACTIONS[label],
+        "classification": result["classification"],
+        "reason": result["reason"],
+        "suggested_action": result["suggested_action"],
+    }
+
+
+@app.post("/handle-reply")
+async def handle_reply(request: Request, x_api_key: str = Header(default=None)):
+    """PHASE 6 — the real endpoint n8n's Email Trigger (IMAP) should call
+    directly, one HTTP Request node, no per-contact configuration.
+
+    Given the raw 'from' header and the reply body straight off the IMAP
+    node, this: (1) extracts the sender's email, (2) checks HubSpot for a
+    matching contact — replacing what would otherwise be a hardcoded
+    n8n filter of specific addresses, so the list can grow to 300 leads
+    without touching the workflow, (3) if it's a known contact, classifies
+    the reply the same way /classify-reply does, (4) returns a single
+    'action' field n8n can Switch on directly: 'ignore' (not a known
+    contact — inbox noise), or one of the four REPLY_LABELS.
+
+        POST /handle-reply
+        Headers: x-api-key: <same DOMAIN_CHECKER_API_KEY as above>
+        Body (JSON): {"from": "<the raw From header>", "reply_text": "<body>"}
+
+    Needs HUBSPOT_API_KEY set (a HubSpot Private App token with at least
+    crm.objects.contacts.read) in addition to ANTHROPIC_API_KEY.
+    """
+    if API_KEY and x_api_key != API_KEY:
+        raise HTTPException(status_code=401, detail="invalid or missing x-api-key header")
+
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+
+    raw_from = await get_field(request, body, "from")
+    reply_text = await get_field(request, body, "reply_text")
+
+    if not raw_from:
+        raise HTTPException(
+            status_code=422,
+            detail="need 'from' — the raw From header of the email (e.g. 'Name <a@b.com>')",
+        )
+
+    sender_email = extract_email(raw_from)
+    contact = find_hubspot_contact(sender_email)
+
+    if not contact:
+        return {
+            "action": "ignore",
+            "sender_email": sender_email,
+            "reason": "sender is not a known contact in HubSpot — not a reply to our outreach",
+        }
+
+    hubspot_contact_id = contact.get("id")
+    company_name = (contact.get("properties") or {}).get("company")
+
+    if not reply_text:
+        return {
+            "action": "needs_info",
+            "sender_email": sender_email,
+            "hubspot_contact_id": hubspot_contact_id,
+            "company_name": company_name,
+            "reason": "known contact replied but no text body was found on the email",
+            "suggested_action": REPLY_ACTIONS["needs_info"],
+        }
+
+    result = classify_reply_text(reply_text, company_name)
+
+    return {
+        "action": result["classification"],
+        "sender_email": sender_email,
+        "hubspot_contact_id": hubspot_contact_id,
+        "company_name": company_name,
+        "reply_text": reply_text,
+        "classification": result["classification"],
+        "reason": result["reason"],
+        "suggested_action": result["suggested_action"],
     }
 
 
