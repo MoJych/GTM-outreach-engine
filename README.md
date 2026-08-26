@@ -6,6 +6,8 @@ Five endpoints: check whether a company's site is alive, write a personalized co
 
 Built while learning the GTM engineering stack (Clay + n8n + Python), and used to run my own outbound.
 
+**This service is one half of a system.** The other half is a Clay pipeline that sources, researches and scores the companies, and an n8n workflow that watches the inbox. The full write-up of the whole thing — what it does, what it produced, and what broke — is the case study: **[Client Acquisition Engine v1](https://verbose-pump-a52.notion.site/Client-Acquisition-Engine-v1-GTM-Case-Study-3c2591ff7ce18082969dd93cf07edcd8)**. This README is the engineering detail behind it.
+
 ---
 
 ## How it fits together
@@ -42,7 +44,7 @@ The service is reachable during development through an ngrok tunnel, so both Cla
 | `/handle-reply` | POST | `x-api-key` + `ANTHROPIC_API_KEY` + `HUBSPOT_API_KEY` | The one n8n actually calls. Resolves the sender against HubSpot first, then classifies. |
 | `/health` | GET | none | Returns `{"status": "ok"}`. |
 
-Every endpoint accepts its fields **either as query parameters or as a JSON body**, because different callers send data differently (see "What I learned" below).
+Every endpoint that takes input accepts its fields **either as query parameters or as a JSON body**, because different callers send data differently (see "What I learned" below).
 
 ### `POST /check-domain`
 
@@ -87,11 +89,14 @@ Headers: x-api-key: <DOMAIN_CHECKER_API_KEY>
 
 **The quality gate is the point of this endpoint, not the LLM call.** It's a cheap heuristic check — deliberately *not* a second LLM call — that rejects an opener which:
 
-- uses a cold-email cliché ("I hope this email finds you well", "I noticed your website", …)
-- looks like a model refusal rather than an opener
-- is too long or too short to read as a real sentence
-- doesn't share a single meaningful word with the fact it was supposed to be based on
-- contains an unfilled placeholder like `[specific use case]`
+1. uses a cold-email cliché ("I hope this email finds you well", "I noticed your website", …)
+2. looks like a model refusal rather than an opener
+3. is longer than 30 words
+4. is shorter than 4 words
+5. doesn't share a single meaningful word with the fact it was supposed to be based on
+6. contains an unfilled placeholder like `[specific use case]`
+
+Six checks, seven with `intent=job` (below).
 
 When it fails, `quality_notes` lists exactly which rules fired. Nothing goes out the door without a stated reason it's fine to send.
 
@@ -163,7 +168,7 @@ Then point Clay's HTTP API column or n8n's HTTP Request node at `https://<ngrok-
 
 ## What I learned building this
 
-- **Query param vs. JSON body.** Clay's HTTP API column sends the domain as a URL query parameter (`?domain=example.com`), not a JSON body. The first version only accepted a body, so every real request from Clay failed with a 422. Fixed by accepting either — which is why there's a `get_field()` helper reading the query string first and the parsed body second.
+- **Query param vs. JSON body.** Clay's HTTP API column sends the domain as a URL query parameter (`?domain=example.com`), not a JSON body. The first version only accepted a body, so every real request from Clay failed with a 422. Fixed by accepting either. `/check-domain` does this inline, because it was written first; every endpoint added since goes through a `get_field()` helper that reads the query string first and the parsed body second. That duplication is still there and `/check-domain` should be moved onto the helper.
 - **Windows PowerShell isn't bash.** `export VAR=value` doesn't work — it's `$env:VAR = "value"`, and it only lasts for that terminal window. PowerShell's `curl` is an alias for `Invoke-WebRequest`, which doesn't take `-X`/`-H`; `Invoke-RestMethod` or `curl.exe` is the reliable way to test.
 - **Simple auth matters the second a local server goes public.** An ngrok tunnel makes a laptop reachable by anyone with the URL. A single shared-secret header is a five-line fix.
 - **An LLM will happily leave a template blank in its output.** The first version of `/personalize-opener` returned lines like `"...exploring integrations with [specific use case]."` — a literal unfilled placeholder that would look broken to a real prospect. Fixed twice over: told the prompt never to use placeholder brackets, *and* added a gate rule rejecting any opener containing `[` or `]`, as a backstop for when the prompt fix isn't enough.
@@ -176,7 +181,7 @@ Then point Clay's HTTP API column or n8n's HTTP Request node at `https://<ngrok-
 
 ## Honest status
 
-What's real: all five endpoints work and are called from live Clay columns and a live n8n workflow. The Clay pipeline has run end to end against real companies. The reply workflow is active against a real inbox.
+What's real: all five endpoints work. `/check-domain` and `/personalize-opener` are called from live Clay HTTP API columns and the pipeline has run end to end against a real company list. `/handle-reply` is called by an n8n workflow bound to a real IMAP inbox.
 
 What isn't, yet:
 
@@ -194,4 +199,6 @@ What isn't, yet:
 - [ ] Replace the `NoOp` branches with real HubSpot / Calendly / Slack actions
 - [ ] Move off ngrok to permanent hosting
 - [ ] Feed `is_live` / `response_time_ms` into personalization — skip dead sites, or reference site speed as a genuine observation
+- [ ] Add a job-openings signal to the scoring, and feed it into personalization
+- [ ] Move `/check-domain` onto the `get_field()` helper instead of its own inline copy
 - [ ] Add tests around `quality_gate()` and the label-recovery fallback, the two places where a silent wrong answer is most expensive
