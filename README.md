@@ -166,6 +166,23 @@ Then point Clay's HTTP API column or n8n's HTTP Request node at `https://<ngrok-
 
 ---
 
+## Deploying to Render (replacing ngrok)
+
+`render.yaml` and `requirements.txt` are in the repo. Two ways to use them:
+
+**Blueprint (one click):** on [render.com](https://render.com), New → Blueprint → connect this GitHub repo. Render reads `render.yaml` and proposes a free web service with the build/start commands already set. *(Not tested against a live Render account as of writing — if the Blueprint step rejects the file, fall back to Manual below, which doesn't depend on `render.yaml` at all.)*
+
+**Manual:** New → Web Service → connect the repo → Build Command `pip install -r requirements.txt` → Start Command `uvicorn main:app --host 0.0.0.0 --port $PORT` → plan Free.
+
+Either way, before the first deploy:
+
+1. **Rotate the API key.** The old `DOMAIN_CHECKER_API_KEY` value (`testkey123`) leaked in plaintext in a shared n8n workflow export — do not carry it onto a permanent public URL. Generate a new random string (e.g. `python -c "import secrets; print(secrets.token_urlsafe(32))"`).
+2. In the service's **Environment** tab, add `DOMAIN_CHECKER_API_KEY` (the new value), `ANTHROPIC_API_KEY`, and `HUBSPOT_API_KEY`. These are secrets — set them in the dashboard only, never commit them (`render.yaml` intentionally marks them `sync: false` so Render prompts for them instead of expecting them in the file).
+3. Deploy. Render assigns a permanent URL (`https://<service-name>.onrender.com`) that doesn't change on restart. Swap it in everywhere the ngrok URL was used: Clay's HTTP API column, both n8n HTTP Request nodes (`/handle-reply` in the reply-loop workflow, `/check-domain` in the test workflow), and the `x-api-key` header on each.
+4. The free plan spins down after ~15 minutes idle; the first request after that takes ~30–50s to wake it up. For a low-volume reply-triage webhook this is a non-issue, but worth knowing if a test call ever times out.
+
+---
+
 ## What I learned building this
 
 - **Query param vs. JSON body.** Clay's HTTP API column sends the domain as a URL query parameter (`?domain=example.com`), not a JSON body. The first version only accepted a body, so every real request from Clay failed with a 422. Fixed by accepting either. `/check-domain` does this inline, because it was written first; every endpoint added since goes through a `get_field()` helper that reads the query string first and the parsed body second. That duplication is still there and `/check-domain` should be moved onto the helper.
@@ -185,7 +202,7 @@ What's real: all five endpoints work. `/check-domain` and `/personalize-opener` 
 
 What isn't, yet:
 
-- **Hosting is still an ngrok tunnel**, so the public URL changes on restart. Moving to Railway/Render is the next infrastructure job.
+- **Hosting is still an ngrok tunnel**, so the public URL changes on restart. Deploy config for Render (`render.yaml`, `requirements.txt`) is in the repo, but the service hasn't been switched over yet — that's a five-minute dashboard job, see "Deploying to Render" above.
 - **n8n's outcome branches are still `NoOp` nodes** — the workflow classifies a reply and sends me a Telegram notification, but "update HubSpot stage" and "send a Calendly link" are placeholders, not wired actions. It's detect-and-notify, not detect-and-act.
 - **Sending is manual.** The pipeline generates and stores openers; a human still presses send.
 - **No automated tests.** Every endpoint has been smoke-tested by hand and against real data, which is not the same thing.
