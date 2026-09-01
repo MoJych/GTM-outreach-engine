@@ -233,6 +233,29 @@ REFUSAL_PATTERNS = [
 ]
 
 
+# The gate checks what the opener claims about THEM — the context-overlap
+# rule below. It had nothing on what the opener claims about ME. Asked to
+# write outreach that sells, the model fills the credibility gap with a
+# track record: "for three revenue teams this year", "twice before",
+# "at scale". I have no clients yet, so every one of those is false, and
+# it is the kind of false that ends the conversation on the first call
+# rather than in the inbox.
+#
+# The endpoint cannot verify a claim about the sender from in here, so it
+# rejects the whole class instead. The opener has to stand on the system
+# being real, which it is, and not on history that isn't.
+SELF_CLAIM_PATTERNS = [
+    r"\bi'?ve\s+\w+(\s+\w+){0,5}\s+(twice|three times|\d+\s+times)\b",
+    r"\b(two|three|four|five|\d+)\s+(b2b\s+)?(companies|teams|clients|startups|revenue teams)\b",
+    r"\bfor\s+(b2b\s+)?(companies|teams|clients)\b",
+    r"\bat scale\b",
+    r"\bthis year\b",
+    r"\b(twice|three times)\s+before\b",
+    r"\bproven\b",
+    r"\bi'?ve\s+\w+(\s+\w+){0,6}\s+before\b",
+]
+
+
 # Matches the address inside "Display Name <email@domain.com>" — n8n's
 # IMAP node sends `from` in this shape almost always, occasionally as a
 # bare address with no angle brackets at all.
@@ -421,6 +444,14 @@ def quality_gate(opener: str, context: str, intent: str = "service"):
     if context_words and not (context_words & opener_words):
         reasons.append("doesn't seem to reference the given fact")
 
+    for pattern in SELF_CLAIM_PATTERNS:
+        found = re.search(pattern, lower)
+        if found:
+            reasons.append(
+                f"claims a track record that can't be verified here: "
+                f"'{found.group(0)}' — let the opener stand on the system, not on history"
+            )
+
     if "[" in opener or "]" in opener:
         reasons.append("contains an unfilled placeholder like '[...]' — never send this as-is")
 
@@ -571,6 +602,10 @@ async def personalize_opener(request: Request, x_api_key: str = Header(default=N
             f"about them, never with 'I', 'My', 'As', or a greeting. Do not describe "
             f"the sender's skills, do not ask for a job, do not use the words "
             f"'opportunity', 'passionate', or 'reaching out'. No flattery. "
+            f"NEVER claim past clients, past projects, a number of companies "
+            f"served, or work done 'before', 'twice', 'three times' or 'at "
+            f"scale' — the sender has no client history and any such claim is "
+            f"false. See SELF_CLAIM_PATTERNS: the gate rejects these anyway. "
             f"The goal is to sound like someone who already looked closely at their "
             f"business, not like an applicant. "
             + shared_rules
