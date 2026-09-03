@@ -8,3 +8,13 @@ __pycache__/
 *.csv
 !example*.csv
 emails-week-*.md
+
+# Добавлено 3 сен 2026. git status показал два untracked-файла с живыми
+# адресами реальных людей, которые ни одно из правил выше не закрывало:
+# followups-4-sept.md (шесть адресов) и pointone-pilot-10.csv.bak
+# (десять адресов партнёров юрфирм). Правило *.csv не покрывает .bak,
+# а emails-week-*.md не покрывает followups-*.md. Репозиторий публичный.
+*.bak
+followups-*.md
+pilot-*.md
+*-pilot-*.csv

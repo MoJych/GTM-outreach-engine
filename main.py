@@ -253,6 +253,28 @@ SELF_CLAIM_PATTERNS = [
     r"\b(twice|three times)\s+before\b",
     r"\bproven\b",
     r"\bi'?ve\s+\w+(\s+\w+){0,6}\s+before\b",
+
+    # Added 3 Sep 2026, after a real miss. The patterns above catch
+    # boasting about the PAST — "I've done this twice before", "for three
+    # revenue teams". They caught nothing when the model boasted in the
+    # PRESENT tense instead: an opener written for a law firm passed the
+    # gate saying "I work with transportation carriers on casualty
+    # defense strategies". I don't. Same unverifiable claim about the
+    # sender, different tense, and the old list had no handle on it.
+    #
+    # "I build X" stays allowed on purpose: it describes the system,
+    # which exists and is linkable. "I work with X" implies clients,
+    # which do not.
+    r"\bi\s+work\s+with\b",
+    r"\bi'?ve\s+worked\s+with\b",
+    r"\bwe\s+work\s+with\b",
+    r"\bmy\s+clients?\b",
+    r"\bour\s+clients?\b",
+    r"\bi\s+specialize\s+in\b",
+    r"\bi\s+regularly\b",
+    r"\bmy\s+background\s+(in|with)\b",
+    r"\bmy\s+experience\s+(in|with)\b",
+    r"\bi\s+help\s+(companies|firms|teams|clients|businesses)\b",
 ]
 
 
