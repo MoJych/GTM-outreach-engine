@@ -30,7 +30,7 @@ back into the table          Anthropic API      ──────────�
    HubSpot                                      auto_reply / needs_info
 ```
 
-The service is reachable during development through an ngrok tunnel, so both Clay's HTTP API column and n8n's HTTP Request node can call it before it's deployed anywhere permanent.
+The service is deployed on Render at `https://gtm-outreach-engine-w652.onrender.com` — Clay's HTTP API column and n8n's HTTP Request node call it there. During development it ran behind an ngrok tunnel; the ngrok instructions below are kept for anyone who wants to run it locally.
 
 ---
 
@@ -211,11 +211,11 @@ Either way, before the first deploy:
 
 ## Honest status
 
-What's real: all five endpoints work. `/check-domain` and `/personalize-opener` are called from live Clay HTTP API columns and the pipeline has run end to end against a real company list. `/handle-reply` is called by an n8n workflow bound to a real IMAP inbox.
+What's real: the service is live on Render and all five endpoints work. `/check-domain` and `/personalize-opener` are called from live Clay HTTP API columns and the pipeline has run end to end against a real company list. `/handle-reply` is called by an n8n workflow bound to a real IMAP inbox.
 
 What isn't, yet:
 
-- **Hosting is still an ngrok tunnel**, so the public URL changes on restart. Deploy config for Render (`render.yaml`, `requirements.txt`) is in the repo, but the service hasn't been switched over yet — that's a five-minute dashboard job, see "Deploying to Render" above.
+- **No persistence.** The service is stateless: three dependencies, no database. Nothing records which company was contacted, when, or with what — that lives in a CSV outside the service. There is no suppression list and no deduplication, so nothing stops the same person being contacted twice. This is the largest gap between what is here and something that could run a campaign for someone else, and it is the next thing being built.
 - **n8n's outcome branches are still `NoOp` nodes** — the workflow classifies a reply and sends me a Telegram notification, but "update HubSpot stage" and "send a Calendly link" are placeholders, not wired actions. It's detect-and-notify, not detect-and-act.
 - **Sending is manual.** The pipeline generates and stores openers; a human still presses send.
 - **No automated tests.** Every endpoint has been smoke-tested by hand and against real data, which is not the same thing.
@@ -227,7 +227,8 @@ What isn't, yet:
 - [x] Wire `/personalize-opener` into Clay using a real per-company signal as `context`
 - [x] Close the loop past "email sent" — reply classification and CRM-aware routing
 - [ ] Replace the `NoOp` branches with real HubSpot / Calendly / Slack actions
-- [ ] Move off ngrok to permanent hosting
+- [x] Move off ngrok to permanent hosting (Render, `gtm-outreach-engine-w652.onrender.com`)
+- [ ] Add a Postgres layer: `contacts` and `touches`, a suppression list, and dedupe on send
 - [ ] Feed `is_live` / `response_time_ms` into personalization — skip dead sites, or reference site speed as a genuine observation
 - [ ] Add a job-openings signal to the scoring, and feed it into personalization
 - [ ] Move `/check-domain` onto the `get_field()` helper instead of its own inline copy
