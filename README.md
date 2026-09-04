@@ -94,9 +94,22 @@ Headers: x-api-key: <DOMAIN_CHECKER_API_KEY>
 3. is longer than 30 words
 4. is shorter than 4 words
 5. doesn't share a single meaningful word with the fact it was supposed to be based on
-6. contains an unfilled placeholder like `[specific use case]`
+6. claims a track record the sender can't prove — "for three revenue teams", "twice before", "at scale", "I work with…", "my clients"
+7. contains an unfilled placeholder like `[specific use case]`
 
-Six checks, seven with `intent=job` (below).
+Seven checks, eight with `intent=job` (below).
+
+Rule 6 was added on 1 Sep 2026 after reading 27 openers the gate had already
+passed: nine of them told the prospect I'd done this before for other revenue
+teams. I have no clients, the prompt forbade it in plain English, and the model
+wrote it anyway. Sixteen of the twenty-seven survived the new rule.
+
+It was widened on 3 Sep 2026 for the same reason one tense over. The original
+patterns caught boasting about the past; an opener written for a law firm then
+passed the gate saying "I work with transportation carriers on casualty defense
+strategies". Also untrue, also unverifiable from in here. `I build X` stays
+allowed on purpose — it describes a system that exists and is linkable. `I work
+with X` implies clients that don't.
 
 When it fails, `quality_notes` lists exactly which rules fired. Nothing goes out the door without a stated reason it's fine to send.
 
