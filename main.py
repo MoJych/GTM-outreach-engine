@@ -33,9 +33,8 @@ HOW TO RUN
        Headers: x-api-key: <the same secret from step 2>
        Body (JSON): {"domain": "example.com"}
 
-If you skip step 2 (no DOMAIN_CHECKER_API_KEY set), the key check is
-skipped entirely — fine for a quick local test, not fine once the ngrok
-URL is live and reachable by anyone.
+If DOMAIN_CHECKER_API_KEY is missing, protected endpoints return 503.
+Set the key for local development as well as public deployments.
 
 PHASE 4 ADDITION — /personalize-opener
 ---------------------------------------
@@ -98,6 +97,10 @@ Both run through the same endpoints, switched by one field.
 import os
 import re
 import time
+import secrets
+import json
+from starlette.concurrency import run_in_threadpool
+from safe_http import public_request, parse_public_url
 
 from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import JSONResponse
@@ -116,7 +119,7 @@ app = FastAPI(default_response_class=UTF8JSONResponse)
 
 # Shared-secret auth: set this env var before starting the server. Any
 # caller must send the same value back in the x-api-key header, or they
-# get a 401. Leave it unset only for quick local testing.
+# get a 401. Missing server configuration returns 503.
 API_KEY = os.environ.get("DOMAIN_CHECKER_API_KEY")
 
 # Anthropic API key for the /personalize-opener and /classify-reply
@@ -132,7 +135,7 @@ ANTHROPIC_MODEL = "claude-haiku-4-5"
 # Private Apps, with at least crm.objects.contacts.read scope.
 HUBSPOT_API_KEY = os.environ.get("HUBSPOT_API_KEY")
 
-# The only four buckets /classify-reply is allowed to hand back — keeping
+# The five buckets /classify-reply is allowed to hand back — keeping
 # this a short, fixed set (rather than free-text) is what makes it safe
 # for n8n to branch on downstream without another layer of parsing.
 REPLY_LABELS = (
@@ -142,13 +145,6 @@ REPLY_LABELS = (
     "auto_reply",
     "needs_info",
 )
-
-# Ordered longest-first for the fallback scan in classify_reply_text().
-# This matters: "interested" is a substring of "not_interested", so a
-# naive scan over REPLY_LABELS in declaration order would read a clear
-# rejection as interest. Scanning longest-first makes the specific label
-# win over the one contained inside it.
-REPLY_LABELS_BY_LENGTH = tuple(sorted(REPLY_LABELS, key=len, reverse=True))
 
 # What n8n should do for each label. This travels in the response so the
 # n8n workflow can switch on `suggested_action` directly instead of
@@ -381,37 +377,46 @@ def classify_reply_text(reply_text: str, company_name: str = None) -> dict:
         raw = data["content"][0]["text"].strip()
     except requests.exceptions.RequestException as e:
         raise HTTPException(status_code=502, detail=f"LLM call failed: {e}")
-    except (KeyError, IndexError):
+    except (KeyError, IndexError, TypeError, AttributeError):
         raise HTTPException(status_code=502, detail="unexpected response shape from LLM API")
 
-    # Parse "label: reason" — fall back to needs_info if the model didn't
-    # follow the format, rather than crashing the endpoint. This mirrors
-    # quality_gate()'s philosophy: never let malformed LLM output become
-    # a silent wrong answer, make the uncertainty visible instead.
-    label, _, reason = raw.partition(":")
-    label = label.strip().lower()
-    reason = reason.strip() or raw
+    return parse_classification(raw)
 
-    if label not in REPLY_LABELS:
-        # Seen live on 24 Aug 2026: the model echoed the literal word
-        # "LABEL" from the format instructions instead of substituting a
-        # real one. The correct label was right there in the string,
-        # just not before the first colon — so before giving up, scan
-        # the whole response for one of the four known labels.
-        lower_raw = raw.lower()
-        recovered = next((l for l in REPLY_LABELS_BY_LENGTH if l in lower_raw), None)
-        if recovered:
-            label = recovered
-            reason = f"recovered via fallback scan (model ignored the format), raw output: '{raw}'"
-        else:
-            label = "needs_info"
-            reason = f"model did not return a recognized label, raw output: '{raw}'"
 
+def parse_classification(raw: str) -> dict:
+    """Accept the exact label: reason contract; never infer labels from prose."""
+    label, separator, reason = raw.partition(":")
+    label, reason = label.strip().lower(), reason.strip()
+    parse_error = not separator or label not in REPLY_LABELS or not reason
+    if parse_error:
+        label = "needs_info"
+        reason = "invalid model output format; manual review required"
     return {
         "classification": label,
         "reason": reason,
         "suggested_action": REPLY_ACTIONS[label],
+        "parse_error": parse_error,
     }
+
+
+def require_api_key(provided):
+    if not API_KEY or not API_KEY.strip():
+        raise HTTPException(503, "server authentication is not configured")
+    if not provided or not secrets.compare_digest(provided.encode(), API_KEY.encode()):
+        raise HTTPException(401, "invalid or missing x-api-key header")
+
+
+async def read_body(request):
+    raw = await request.body()
+    if not raw:
+        return {}
+    try:
+        body = json.loads(raw)
+    except (ValueError, UnicodeError):
+        raise HTTPException(422, "request body must contain valid JSON")
+    if not isinstance(body, dict):
+        raise HTTPException(422, "request body must be a JSON object")
+    return body
 
 
 async def get_field(request: Request, body: dict, name: str):
@@ -419,18 +424,25 @@ async def get_field(request: Request, body: dict, name: str):
     already-parsed JSON body — same flexible pattern as /check-domain,
     since different tools (Clay, n8n, curl) send data differently."""
     value = request.query_params.get(name)
-    if value:
-        return value
-    return body.get(name) if body else None
+    if not value:
+        value = body.get(name)
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise HTTPException(422, f"'{name}' must be a string")
+    limit = 253 if name == "domain" else 20000
+    if len(value) > limit:
+        raise HTTPException(422, f"'{name}' exceeds {limit} characters")
+    return value.strip()
 
 
 def clean_domain(raw: str) -> str:
-    """Strip any scheme/leading-or-trailing slash the caller might have
-    included, so 'https://example.com/', '/example.com', and
-    'example.com' all behave the same."""
-    d = raw.strip()
-    d = d.replace("https://", "").replace("http://", "")
-    return d.strip("/")
+    value = raw.strip().strip("/")
+    parts, host, port = parse_public_url(value if "://" in value else "https://" + value)
+    if parts.path not in ("", "/") or parts.query or parts.fragment:
+        raise HTTPException(422, "domain must not include a path, query or fragment")
+    authority = f"[{host}]" if ":" in host else host
+    return authority + (f":{parts.port}" if parts.port else "")
 
 
 def quality_gate(opener: str, context: str, intent: str = "service"):
@@ -497,34 +509,20 @@ def quality_gate(opener: str, context: str, intent: str = "service"):
 def probe(url: str):
     """HEAD first (cheap — no body downloaded). Some servers reject HEAD
     with 405, so fall back to GET in that case."""
-    start = time.time()
-    response = requests.head(
-        url, timeout=TIMEOUT_SECONDS, headers=REQUEST_HEADERS, allow_redirects=True
-    )
+    start = time.monotonic()
+    response = public_request(url, timeout=TIMEOUT_SECONDS, headers=REQUEST_HEADERS)
     if response.status_code == 405:
-        response = requests.get(
-            url, timeout=TIMEOUT_SECONDS, headers=REQUEST_HEADERS, allow_redirects=True
-        )
-    elapsed_ms = round((time.time() - start) * 1000)
+        response = public_request(response.url, method="GET", timeout=TIMEOUT_SECONDS, headers=REQUEST_HEADERS)
+    elapsed_ms = round((time.monotonic() - start) * 1000)
     return response, elapsed_ms
 
 
 @app.post("/check-domain")
 async def check_domain(request: Request, x_api_key: str = Header(default=None)):
-    if API_KEY and x_api_key != API_KEY:
-        raise HTTPException(status_code=401, detail="invalid or missing x-api-key header")
+    require_api_key(x_api_key)
 
-    # Accept the domain from a query param (?domain=example.com) — the
-    # form Clay's HTTP API columns tend to use — or from a JSON body
-    # ({"domain": "example.com"}), so the caller doesn't have to be
-    # configured a particular way.
-    raw_domain = request.query_params.get("domain")
-    if not raw_domain:
-        try:
-            body = await request.json()
-            raw_domain = body.get("domain") if body else None
-        except Exception:
-            raw_domain = None
+    body = await read_body(request)
+    raw_domain = await get_field(request, body, "domain")
 
     if not raw_domain:
         raise HTTPException(
@@ -540,7 +538,7 @@ async def check_domain(request: Request, x_api_key: str = Header(default=None)):
     for scheme in ("https", "http"):
         url = f"{scheme}://{domain}"
         try:
-            response, elapsed_ms = probe(url)
+            response, elapsed_ms = await run_in_threadpool(probe, url)
             return {
                 "domain": domain,
                 "is_live": True,
@@ -558,8 +556,7 @@ async def check_domain(request: Request, x_api_key: str = Header(default=None)):
 
 @app.post("/personalize-opener")
 async def personalize_opener(request: Request, x_api_key: str = Header(default=None)):
-    if API_KEY and x_api_key != API_KEY:
-        raise HTTPException(status_code=401, detail="invalid or missing x-api-key header")
+    require_api_key(x_api_key)
 
     if not ANTHROPIC_API_KEY:
         raise HTTPException(
@@ -567,10 +564,7 @@ async def personalize_opener(request: Request, x_api_key: str = Header(default=N
             detail="server is missing ANTHROPIC_API_KEY — set it and restart the server",
         )
 
-    try:
-        body = await request.json()
-    except Exception:
-        body = {}
+    body = await read_body(request)
 
     company_name = await get_field(request, body, "company_name")
     domain = await get_field(request, body, "domain")
@@ -643,7 +637,7 @@ async def personalize_opener(request: Request, x_api_key: str = Header(default=N
         )
 
     try:
-        resp = requests.post(
+        resp = await run_in_threadpool(requests.post,
             "https://api.anthropic.com/v1/messages",
             headers={
                 "x-api-key": ANTHROPIC_API_KEY,
@@ -662,7 +656,7 @@ async def personalize_opener(request: Request, x_api_key: str = Header(default=N
         opener = data["content"][0]["text"].strip()
     except requests.exceptions.RequestException as e:
         raise HTTPException(status_code=502, detail=f"LLM call failed: {e}")
-    except (KeyError, IndexError):
+    except (KeyError, IndexError, TypeError, AttributeError):
         raise HTTPException(status_code=502, detail="unexpected response shape from LLM API")
 
     passed, reasons = quality_gate(opener, context, intent)
@@ -683,13 +677,9 @@ async def classify_reply(request: Request, x_api_key: str = Header(default=None)
     no HubSpot lookup involved. Kept as-is for the Edit Fields-driven
     testing workflow already validated in n8n. The real IMAP-driven path
     is /handle-reply below, which adds the HubSpot sender check first."""
-    if API_KEY and x_api_key != API_KEY:
-        raise HTTPException(status_code=401, detail="invalid or missing x-api-key header")
+    require_api_key(x_api_key)
 
-    try:
-        body = await request.json()
-    except Exception:
-        body = {}
+    body = await read_body(request)
 
     reply_text = await get_field(request, body, "reply_text")
     company_name = await get_field(request, body, "company_name")
@@ -700,12 +690,13 @@ async def classify_reply(request: Request, x_api_key: str = Header(default=None)
             detail="need 'reply_text' — the raw text of the email reply to classify",
         )
 
-    result = classify_reply_text(reply_text, company_name)
+    result = await run_in_threadpool(classify_reply_text, reply_text, company_name)
 
     return {
         "company_name": company_name,
         "reply_text": reply_text,
         "classification": result["classification"],
+        "parse_error": result["parse_error"],
         "reason": result["reason"],
         "suggested_action": result["suggested_action"],
     }
@@ -723,7 +714,7 @@ async def handle_reply(request: Request, x_api_key: str = Header(default=None)):
     without touching the workflow, (3) if it's a known contact, classifies
     the reply the same way /classify-reply does, (4) returns a single
     'action' field n8n can Switch on directly: 'ignore' (not a known
-    contact — inbox noise), or one of the four REPLY_LABELS.
+    contact — inbox noise), or one of the five REPLY_LABELS.
 
         POST /handle-reply
         Headers: x-api-key: <same DOMAIN_CHECKER_API_KEY as above>
@@ -732,13 +723,9 @@ async def handle_reply(request: Request, x_api_key: str = Header(default=None)):
     Needs HUBSPOT_API_KEY set (a HubSpot Private App token with at least
     crm.objects.contacts.read) in addition to ANTHROPIC_API_KEY.
     """
-    if API_KEY and x_api_key != API_KEY:
-        raise HTTPException(status_code=401, detail="invalid or missing x-api-key header")
+    require_api_key(x_api_key)
 
-    try:
-        body = await request.json()
-    except Exception:
-        body = {}
+    body = await read_body(request)
 
     raw_from = await get_field(request, body, "from")
     reply_text = await get_field(request, body, "reply_text")
@@ -750,7 +737,7 @@ async def handle_reply(request: Request, x_api_key: str = Header(default=None)):
         )
 
     sender_email = extract_email(raw_from)
-    contact = find_hubspot_contact(sender_email)
+    contact = await run_in_threadpool(find_hubspot_contact, sender_email)
 
     if not contact:
         return {
@@ -772,7 +759,7 @@ async def handle_reply(request: Request, x_api_key: str = Header(default=None)):
             "suggested_action": REPLY_ACTIONS["needs_info"],
         }
 
-    result = classify_reply_text(reply_text, company_name)
+    result = await run_in_threadpool(classify_reply_text, reply_text, company_name)
 
     return {
         "action": result["classification"],
@@ -781,6 +768,7 @@ async def handle_reply(request: Request, x_api_key: str = Header(default=None)):
         "company_name": company_name,
         "reply_text": reply_text,
         "classification": result["classification"],
+        "parse_error": result["parse_error"],
         "reason": result["reason"],
         "suggested_action": result["suggested_action"],
     }

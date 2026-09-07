@@ -1,20 +1,65 @@
+# Python environments, caches and build outputs
 venv/
+.venv/
+env/
 __pycache__/
-*.pyc
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+build/
+dist/
+*.egg-info/
+
+# Local credentials and configuration
 .env
+.env.*
+!.env.example
+*.pem
+*.key
+credentials.json
+secrets.json
 
-# Рабочие файлы кампании: реальные имена, должности, LinkedIn и личные
-# адреса живых людей. Репозиторий публичный — сюда это не кладём.
+# Campaign data, local databases and backups
 *.csv
-!example*.csv
-emails-week-*.md
-
-# Добавлено 3 сен 2026. git status показал два untracked-файла с живыми
-# адресами реальных людей, которые ни одно из правил выше не закрывало:
-# followups-4-sept.md (шесть адресов) и pointone-pilot-10.csv.bak
-# (десять адресов партнёров юрфирм). Правило *.csv не покрывает .bak,
-# а emails-week-*.md не покрывает followups-*.md. Репозиторий публичный.
+*.tsv
+*.xlsx
+*.db
+*.db-*
+*.sqlite
+*.sqlite3
+*.sqlite-*
+*.sqlite3-*
 *.bak
-followups-*.md
-pilot-*.md
-*-pilot-*.csv
+*.log
+
+# Working n8n exports; application JSON fixtures remain available
+/reply-router*.json
+/n8n*.json
+/workflows/*.json
+
+# Local experiments and campaign notes
+/experiments/
+/work/
+/HANDOFF-context.md
+/START-HERE.md
+/gtm-context-primer.md
+/entry-channels.md
+/loom-script.md
+/direction-*.md
+/plan-to-*.md
+/batch-*.md
+/comments-playbook-*.md
+/emails-week-*.md
+/followups-*.md
+/pilot-*.md
+
+# Editor and operating-system files
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+Desktop.ini

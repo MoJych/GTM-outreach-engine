@@ -46,8 +46,11 @@ def pick(row: dict, names) -> str:
 
 def to_score(raw: str) -> int:
     """'5', 'Fit score (1-5): 4 - Outb...' и пустое -> целое."""
-    m = re.search(r"([1-5])", raw or "")
-    return int(m.group(1)) if m else 0
+    text = (raw or "").strip()
+    if re.fullmatch(r"[1-5]", text):
+        return int(text)
+    match = re.search(r"\bfit score\s*\(1\s*[-–]\s*5\)\s*:\s*([1-5])\b", text, re.I)
+    return int(match.group(1)) if match else 0
 
 
 def extract_fact(text: str) -> str:
